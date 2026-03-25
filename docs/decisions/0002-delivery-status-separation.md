@@ -1,7 +1,7 @@
 # 0002 — Separacao delivery_status + deteccao de saida via 930
 
-**Data**: 2026-03-24
-**Status**: Implementado e deployado. Validado parcialmente.
+**Data**: 2026-03-24 (implementado) / 2026-03-25 (atualizado com backfills finais)
+**Status**: Implementado, deployado e validado. Concluido.
 **Supersedes**: [0001 — Cards antigos no coletor](./0001-stale-cards-930-departure-detection.md)
 **Repos afetados**: `laplace-data-warehouse`, `laplace-service-loss-prediction`, `laplace-platform-api`, `laplace-platform`
 **Issues**:
@@ -91,7 +91,7 @@ Nova funcao `close_departed_verifications()` que cruza `loss_verification` com `
 
 ### 3.3 Usar 930 para `arrived_at` preciso
 
-Quando disponivel, usar timestamp do evento de chegada (93/94) da 930. Fallback para `NOW()` se a 930 nao tiver o evento ainda.
+Quando disponivel, usar timestamp do evento de chegada (93/94) da 930. Fallback para evento de emissao (cod 97 = CT-E EMITIDO) para cargas criadas na unidade. Se nenhum evento disponivel na 930, usar `NULL` (indicando dado indisponivel) em vez de `NOW()` — evita enganar a operacao com horarios falsos.
 
 ### 3.4 Separar `delivery_status` de `verification_status`
 
@@ -225,7 +225,8 @@ erDiagram
 | `close_departed_verifications()` | Seta `delivery_status` (departed/delivered) em vez de `verification_status`. Duas queries separadas: primeiro entregas (cod 1,11), depois saidas (cod 87,95). Filtro por timestamp completo. |
 | `close_stale_verifications()` | Agora tambem seta `delivery_status` via CASE: `is_delivered=true` -> delivered, location changed -> departed |
 | `get_930_arrival_time()` | Busca evento de chegada (93/94) na 930. Retorna timestamp ou None. |
-| `sync_missing_ctrcs()` | Usa `arrived_at` da 930 com fallback para `NOW()` |
+| `get_930_arrival_time()` | Busca evento de chegada (93/94) ou emissao (97) na 930. Retorna timestamp ou None (NULL no banco). |
+| `sync_missing_ctrcs()` | Usa `arrived_at` da 930 com fallback para `NULL` (dado indisponivel) |
 
 **Migrations executadas**:
 
@@ -279,15 +280,21 @@ Coluna `hora_ocor` na 930 e `varchar`, nao `time`. COALESCE falhava por type mis
 
 ## 7. Estado atual
 
-### Dados na loss_verification (tenant_id=1, 2026-03-24):
+### Dados na loss_verification (tenant_id=1, pos-backfill 2026-03-25):
 
 | delivery_status | Quantidade | Significado |
 |----------------|-----------|-------------|
-| NULL (em unidade) | 10.151 | Carga genuinamente na unidade |
-| departed | 4.519 | Carga saiu da unidade |
-| delivered | 5.114 | Carga entregue |
+| NULL (em unidade) | ~9.345 | Carga genuinamente na unidade |
+| departed | ~5.197 | Carga saiu da unidade |
+| delivered | ~5.395 | Carga entregue |
 
-### CTRCs "em unidade" — analise dos 10.151
+| arrived_at | Quantidade | Fonte |
+|-----------|-----------|-------|
+| Da 930 (93/94 chegada) | ~13.588 | Evento de chegada na unidade |
+| Da 930 (97 CT-E emitido) | ~4.789 | Carga criada na unidade |
+| NULL (sem dados) | ~1.588 | 930 nao tem historico |
+
+### CTRCs "em unidade" — analise dos ~9.345
 
 | Situacao na 455 | Quantidade | Genuino? |
 |-----------------|-----------|----------|
@@ -301,17 +308,16 @@ Coluna `hora_ocor` na 930 e `varchar`, nao `time`. COALESCE falhava por type mis
 
 ### Limitacoes conhecidas
 
-1. **`arrived_at` impreciso para CTRCs antigos**: CTRCs do primeiro dia de operacao (18/03) tem `arrived_at = NOW()` pois a 930 nao tem historico. Corrigivel via backfill da 930 (issue [data-warehouse#13](https://github.com/laplace-ai/laplace-data-warehouse/issues/13)).
+1. **`arrived_at = NULL` para ~1.588 pares CTRC+unidade**: a 930 nao tem evento de chegada (93/94) nem emissao (97) para esses pares. Sao CTRCs antigos cujos eventos ja sairam da janela de retencao. Exibido como "—" no frontend.
 
-2. **Cobertura da 930**: dados com volume so a partir de ~06/03/2026. CTRCs anteriores dependem exclusivamente da 455 para deteccao de entrega/saida.
+2. **Cobertura da 930**: dados historicos carregados desde 06/2025. CTRCs anteriores dependem exclusivamente da 455 para deteccao de entrega/saida.
 
-3. **CTRCs genuinamente parados**: ~9.500 CTRCs com `delivery_status IS NULL` e `localizacao_atual_code = unit_code`. Investigacao comprovou que sao cargas retidas. Nao sao bugs.
+3. **CTRCs genuinamente parados**: ~9.345 CTRCs com `delivery_status IS NULL`. Investigacao comprovou que sao cargas retidas (aguardando devolucao, agendamento, processo arquivado, pendencia financeira). Nao sao bugs.
 
 ---
 
 ## 8. Evolucao futura
 
-- **Backfill historico da 930** ([data-warehouse#13](https://github.com/laplace-ai/laplace-data-warehouse/issues/13)): carregar snapshots antigos para corrigir `arrived_at` e capturar saidas historicas
 - **Expandir retencao da 930** ([data-warehouse#15](https://github.com/laplace-ai/laplace-data-warehouse/issues/15)): manter 6-12 meses de eventos
 - **`promoted_at`**: adicionar timestamp de quando o CTRC foi promovido de etapa
 - **Deteccao de chegada via 930**: migrar deteccao de "em qual unidade esta" da 455 para 930 (elimina latencia do snapshot mensal)
