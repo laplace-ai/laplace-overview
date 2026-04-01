@@ -16,61 +16,79 @@ The `base_930_cleaned` events (specifically codes 93 "CHEGADA NA UNIDADE DE DEST
 
 ## Investigation (2026-04-01)
 
-### Hypothesis 1: 455 ahead of 930 (location set before arrival confirmed)
+### Conceitos-chave
 
-**Active CTRCs (non-delivered), all periods:**
+- **`localizacao_atual_code` (455)**: campo que indica "onde a carga está" segundo o sistema SSW. Atualiza com base no manifesto/roteamento, não na chegada física.
+- **Eventos 93/94 (930)**: registram a **chegada física real** de uma carga numa unidade. São o ground truth.
+- **"Sem confirmação da 930"**: a 455 diz que o CTRC está na unidade X, mas a 930 não tem nenhum evento de chegada (93/94) nessa unidade para esse CTRC.
+
+### Análise 1: CTRCs onde a 455 mostra uma localização sem confirmação de chegada pela 930
+
+Pergunta: dos CTRCs ativos (não entregues), quantos têm `localizacao_atual_code = X` na 455 mas **nenhum evento de chegada (93/94) na unidade X** na 930?
 
 | Metric | Value |
 |--------|-------|
-| Total active CTRCs | 48,029 |
-| 455 location with NO 930 arrival event at that unit | 13,426 (28.0%) |
+| Total de CTRCs ativos | 48,029 |
+| Sem confirmação de chegada pela 930 na unidade indicada pela 455 | **13,426 (28.0%)** |
 
-**Breakdown by unit (top 5):**
+Esses 13,426 CTRCs estão em uma localização segundo a 455 que a 930 nunca confirmou. Para entender o porquê, analisamos o **último evento registrado na 930** para cada um:
 
-| Unit | Total | No 930 arrival | % |
-|------|------:|---------------:|--:|
+| Último evento na 930 | Qtd | O que significa |
+|-----------------------|----:|-----------------|
+| CT-E EMITIDO (97) | 4,224 | CT-e acabou de ser emitido. A 455 já mostra a unidade emissora como localização. A 930 ainda não registrou nenhum evento de movimentação. Na prática a carga pode estar fisicamente na unidade emissora — o problema aqui é menor. |
+| SAIDA DA UNIDADE (95) de outra unidade | 3,816 | **Este é o caso mais problemático.** A carga saiu da unidade A (registrado pela 930), mas a 455 já mostra `localizacao_atual = unidade B` (o destino do manifesto). A carga está em trânsito A→B, mas aparece como "no armazém de B". |
+| CHEGADA (93/94) em unidade diferente | 633 | A 930 confirmou chegada na unidade A, mas a 455 já avançou para a unidade B (próximo destino na rota). A carga está fisicamente em A, completou aquela etapa, e seguiu ou vai seguir viagem para B — mas a 455 antecipou e já mostra B. Mesmo fenômeno, numa etapa intermediária da viagem. |
+| Outros eventos | ~4,753 | Diversos: aguardando agendamento, saída para entrega, etc. São casos onde a 930 tem algum evento mas não de chegada naquela unidade específica. |
+
+**Distribuição por unidade (top 5):**
+
+| Unidade | Total CTRCs | Sem confirmação 930 | % |
+|---------|------------:|--------------------:|--:|
 | BAR | 6,727 | 2,476 | 36.8% |
 | VIX | 5,848 | 1,920 | 32.8% |
 | SAO | 4,543 | 1,646 | 36.2% |
 | BHZ | 4,055 | 1,226 | 30.2% |
 | RIO | 2,911 | 870 | 29.9% |
 
-**What the last 930 event says for these phantom arrivals:**
+### Análise 2: Caso inverso — 930 confirma chegada mas 455 mostra outra localização
 
-| Last 930 event | Count | Meaning |
-|----------------|------:|---------|
-| CT-E EMITIDO (97) | 4,224 | Just emitted, hasn't moved |
-| SAIDA DA UNIDADE (95) | 3,816 | Departed origin, in transit |
-| CHEGADA NA UNIDADE (93/94) at different unit | 633 | Arrived at intermediate, 455 already shows next |
-
-### Hypothesis 2: 930 ahead of 455 (reversed)
+Pergunta inversa: partindo dos **eventos de chegada da 930**, quantos CTRCs têm uma `localizacao_atual_code` diferente na 455?
 
 | Metric | Value |
 |--------|-------|
-| Recent 930 arrivals (since Mar 20) | 72,179 |
-| Location mismatch (930 arrived, 455 shows different) | 2,593 (3.6%) |
+| Chegadas recentes na 930 (desde 20/mar) | 72,179 |
+| Localização na 455 diverge da chegada 930 | 2,593 (3.6%) |
 
-**Conclusion**: The problem is strongly unidirectional — 455 is ahead of 930 in 28% of cases, while the reverse is only 3.6%.
+Este caso é raro. Quando a 930 registra chegada, a 455 geralmente já atualizou (ou até já avançou pro próximo destino). Confirma que o problema é **unidirecional**: a 455 está à frente da 930 em 28% dos casos, o inverso acontece em apenas 3.6%.
 
-### Time gap: manifest → actual arrival (930)
+### Gap temporal: manifesto (455) → chegada real (930)
 
-| Metric | Value |
-|--------|-------|
-| Median gap | 0 days (same day) |
-| Same day arrival | 48% |
-| Next day arrival | 45% |
-| 2+ days | 3% |
-
-### Collector impact
+Para CTRCs onde ambos os dados existem (455 tem data de manifesto E 930 tem chegada na mesma unidade):
 
 | Metric | Value |
 |--------|-------|
-| Total pending in collector | 5,353 |
-| Pending with cargo NOT physically at unit | 131 (2.4%) |
+| Gap mediano | 0 dias (chega no mesmo dia) |
+| Chega no mesmo dia | 48% |
+| Chega no dia seguinte | 45% |
+| 2+ dias | 3% |
 
-### Concrete example (2026-04-01)
+A carga tipicamente chega 0-1 dia após a emissão do manifesto. Ou seja, o CTRC aparece no coletor até 1 dia antes da carga chegar fisicamente.
 
-`RIO600896-8`: 455 says `localizacao_atual_code = SAO`, manifest destination = SAO, but the last 930 event is **SAIDA DA UNIDADE (95) at RIO** — cargo is in transit RIO→SAO but appears in SAO's collector queue.
+### Impacto real no coletor
+
+| Metric | Value |
+|--------|-------|
+| Total de itens pendentes no coletor | 5,353 |
+| Itens onde a carga **não chegou fisicamente** | 131 (2.4%) |
+
+Os 131 itens são CTRCs que aparecem na fila de verificação de uma unidade, mas a 930 não registrou chegada nessa unidade — a carga provavelmente está em trânsito.
+
+### Exemplo concreto (2026-04-01)
+
+`RIO600896-8`:
+- **455**: `localizacao_atual_code = SAO`, manifesto destino = SAO, data manifesto = 01/04
+- **930**: último evento = **SAIDA DA UNIDADE (95) no RIO** em 01/04
+- **Realidade**: carga saiu do RIO com destino a SAO, está em trânsito, mas aparece no coletor de SAO como se já estivesse no armazém
 
 ---
 
