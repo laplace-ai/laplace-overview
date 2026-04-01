@@ -90,28 +90,94 @@ Os 131 itens são CTRCs que aparecem na fila de verificação de uma unidade, ma
 - **930**: último evento = **SAIDA DA UNIDADE (95) no RIO** em 01/04
 - **Realidade**: carga saiu do RIO com destino a SAO, está em trânsito, mas aparece no coletor de SAO como se já estivesse no armazém
 
+### Decomposição refinada dos 28% sem confirmação de chegada
+
+Os 13.426 CTRCs sem evento 93/94 na unidade da 455 se dividem em dois grupos:
+
+**Grupo 1 — Último evento da 930 na MESMA unidade que a 455 mostra (9.316 / 69%)**
+
+A 930 tem atividade nessa unidade, mas não um evento formal de chegada (93/94). A maioria está correta:
+
+| Evento | Qtd | Análise |
+|--------|----:|---------|
+| CT-E EMITIDO (97) | 3.935 | Carga emitida na unidade — está lá, sem "chegada" porque originou ali |
+| SAIDA DA UNIDADE (95) | 1.937 | Carga **já saiu** dessa unidade — 455 desatualizada |
+| AGENDAMENTO (12) | 449 | Processos operacionais na unidade — carga está lá |
+| SAIDA PARA ENTREGA (87) | 433 | Carga saiu pra entrega dessa unidade |
+| RAIO X (40) | 316 | Carga manuseada na unidade — está lá |
+| Outros operacionais | ~2.246 | Devolução, agendamento, paletização, etc. |
+
+**Grupo 2 — Último evento da 930 em OUTRA unidade (4.144 / 31%)**
+
+A carga definitivamente **não está** na unidade que a 455 indica:
+
+| Evento | Qtd | Análise |
+|--------|----:|---------|
+| SAIDA DA UNIDADE (95) | 1.648 | Saiu de outra unidade, em trânsito pro destino da 455 |
+| CHEGADA (93/94) em outra | 829 | Chegou numa intermediária, 455 já avançou |
+| AGENDAMENTO (12) em outra | 359 | Processos em outra unidade |
+| CT-E EMITIDO (97) em outra | 262 | Emitido em outra unidade, 455 já mostra destino |
+| Outros | ~1.046 | Diversos eventos em unidades diferentes |
+
+### Edge case: eventos operacionais sem chegada formal (93/94) nem emissão (97)
+
+Para CTRCs recentes (últimos 4 dias, 17.825 ativos):
+
+| Cenário | Qtd | % |
+|---------|----:|--:|
+| Tem evento 93/94/97 na unidade da 455 | 16.359 | 91.8% |
+| **Tem eventos na unidade, mas NÃO 93/94/97** | **323** | **1.8%** |
+| Nenhum evento na unidade | 1.143 | 6.4% |
+
+Os 323 CTRCs (1.8%) têm apenas eventos operacionais na unidade (raio-x, agendamento, roteirização) sem evento formal de chegada/emissão. Exemplos:
+
+| CTRC | Emissora | Loc 455 | Eventos na unidade (930) |
+|------|----------|---------|--------------------------|
+| ARA978446-2 | ARA | SAO | RAIO X (00:05) → SAIDA DA UNIDADE (00:21) |
+| BAR361809-9 | BAR | CPQ | AGENDAMENTO (16:21) → PALETIZACAO (14:11) |
+| BAR362700-4 | BAR | VIX | AGENDAMENTO → ENTREGA AGENDADA → ROTEIRIZADA → SAIDA ENTREGA |
+| CPQ890150-3 | CPQ | BHZ | AGENDAMENTO (11:47) |
+| EMS889977-1 | EMS | VIX | AGENDAMENTO → ENTREGA AGENDADA |
+| GYN045306-4 | GYN | BHZ | NF LIBERADA → NF RECEBIDA AGENDAMENTO |
+| ITL486765-3 | ITL | ITR | PALETIZACAO (17:35) |
+
+São falhas de registro operacional: a carga passou pela unidade sem evento formal de chegada. **Marginal (1.8%) — aceita-se o delay.**
+
 ---
 
-## Proposed fix
+## Decisão
 
-### Approach: confirmed location via 930
+### Por que manter a 455 como fonte primária
 
-Add a `localizacao_confirmada_code` field (or adjust `localizacao_atual_code` derivation) that only reflects a unit when the 930 has an arrival event (cod_ocor IN 93, 94) for that CTRC at that unit.
+1. A 455 cobre a **grande maioria** dos casos corretamente (91.8% com confirmação da 930)
+2. O caso inverso (930 à frente da 455) é raro (3.6%) — não justifica inverter a lógica
+3. A 455 fornece `localizacao_atual_code` já extraído e pronto — a 930 exigiria computar a última unidade a partir da sequência de eventos
+4. Todos os consumidores downstream (API, coletor, dashboard) já usam `localizacao_atual_code` da 455
 
-**Where to implement**: `laplace-data-warehouse` ETL pipeline, since it already processes both base 455 and base 930.
+### Fix escolhido: double-check com 930 no loss-prediction
 
-**Logic**:
-1. Keep `localizacao_atual_code` from 455 as-is (it still has value for tracking intent/manifest destination)
-2. Add `localizacao_confirmada_code`: the most recent unit where 930 has an arrival event (93/94)
-3. Downstream consumers (loss_verification, collector API) should use `localizacao_confirmada_code` instead of `localizacao_atual_code` when determining which unit a CTRC is physically at
+**Onde**: `laplace-service-loss-prediction/src/verification.py`
 
-**Alternative** (simpler, less disruptive):
-- In the loss prediction service or API, when building the collector queue, cross-check: only include a CTRC at unit X if 930 has an arrival event at X. If not, exclude it from that unit's queue until arrival is confirmed.
+**Lógica**: manter o fluxo atual, mas antes de inserir na `loss_verification`, confirmar na 930 que existe evento de **chegada (93/94)** ou **emissão (97)** naquela unidade para o CTRC.
+
+- A função `get_930_arrival_time()` **já é chamada** para cada CTRC antes do INSERT e retorna `None` quando não há confirmação
+- Fix: se `arrived_at is None` → skip INSERT (não cria registro)
+- CTRCs ignorados serão capturados no próximo ciclo quando a 930 registrar o evento de chegada
+
+**Descartado**: adicionar coluna `localizacao_confirmada_code` na `base_455_cleaned` — a 455 é espelho do sistema do cliente (DELETE+INSERT por período), colunas derivadas seriam perdidas a cada sync.
+
+### Edge cases aceitos
+
+- **1.8%** (323 CTRCs) com eventos operacionais mas sem 93/94/97: não serão criados na `loss_verification`. Delay aceito — a maioria já saiu da unidade.
+- **3.6%** onde 930 está à frente da 455: delay de 1 ciclo (~5min) até a 455 atualizar. Impacto desprezível.
+
+### Backfill
+
+Registros existentes na `loss_verification` com `verification_status = 'pending'` e `arrived_at IS NULL` são cargas inseridas sem confirmação da 930. Avaliar remoção via script.
 
 ---
 
-## Open questions
+## Referências
 
-1. Should we keep showing CTRCs in the collector with a "em trânsito" badge rather than hiding them entirely?
-2. Is `localizacao_confirmada_code` worth adding as a persistent column, or should we compute it on-the-fly in the API?
-3. For the emission unit (where `localizacao_atual_code` = `unidade_emissora`), the cargo IS there — no 930 arrival needed. Need to handle this edge case.
+- Issue DW: laplace-ai/laplace-data-warehouse#16
+- Issue loss-prediction: laplace-ai/laplace-service-loss-prediction#6
